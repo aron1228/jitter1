@@ -1,0 +1,144 @@
+修订版需求文档：基于机台接口的Jitter分解测试程序开发
+（结合 TMUJitterUnit.hpp.txt 实现）
+
+1. 目标
+在现有机台测试接口（TmuJitterUtil 类）的基础上扩展功能，实现以下目标：
+输入：通过机台捕获的时间戳数据（source[i]，单位：秒），替代手动生成的相对TIE数据。
+处理：集成论文中的迭代算法，分解抖动成分（PJ、DCD、ISI）。
+输出：各抖动成分的幅度估计值（PJ幅度、DCD幅度、ISI pk-pk值）及收敛状态，兼容现有日志与报告格式。
+
+2. 输入数据
+时间戳序列
+来源：ARRAY_D& wave_meas（通过 TMU_TASK 执行测量后上传的原始数据）。
+格式：数组形式存储，每个元素为信号边沿的绝对时间戳（单位：秒）。
+
+配置参数
+PRBS模式，设置N，根据PRBSN码流。
+Jittermode默认DATA，（如 DATA、DATA_PERIOD），通过 JitterParameter.mode 指定，其他mode不考虑。
+UI长度（单位：秒），通过 JitterParameter.ui_ns 设置（需转换为秒）。
+初始采样位置offset：通过 JitterParameter 的 S0 字段设置（需新增），初始采样位置通过第一个时间戳减去该偏置来设定。
+Prescaler和discard，设置对应的参数，使得满足TMU测试所支持的最大频率。
+
+
+3. 输出数据
+分解结果
+PJ幅度（单位：秒）。
+DCD幅度（单位：秒）。
+ISI pk-pk值（单位：秒）。
+RJ rms值。
+收敛标志（成功/失败），记录在 JitterResult 结构体中。
+日志与报告
+继承现有日志格式（judgeAndDatalog），新增抖动分解结果字段。
+
+4. 算法流程调整
+1. 数据预处理  
+   - 调用现有 `calculateJitterValues` 生成原始抖动序列 `wave_jitter`。
+   -根据prescaler和discard设置，对初始测量数据序列进行重拍序。  
+   - 根据 `JitterParameter.mode` 提取相对TIE（modTmp = remainder(source[i]-source[0]- 理想翻转点),halfperiod) `）。即用某跳边沿减去第一个理想采样点后除以UI宽度取余，余数即为对应的TIE。 
+    - 
+2. 分离计算PJ（待定）
+   -文章将f0即PJ的基频设为已知频率，实际上需要去计算，计算方法就是从TIE中去除DDJ，然后通过dsp_spectrum函数转到频域，寻找峰值最高对应的频率即为f0。实际上可以通过提前设置，一般系统的PJ来源于时钟馈通，所以f0频率设置为时钟频率即可。
+   -实际上f0来源不止一个，其值不止一个，后面可能要改进模型。
+
+3. 构建H矩阵  
+   - 扩展 `buildHMatrix` 方法，根据论文公式生成子矩阵 A（PJ）、B（DCD）、C（ISI）。  
+   - 需新增字段存储前导码组合（ISI建模依赖的k位模式）。  
+4. 迭代优化  
+   - 新增 `iterateJitterDecomposition` 方法，实现参数更新与采样位置调整：  
+     while (!converged) {  
+       a. 调用最小二乘求解 Δθ = - (H^T H)^-1 H^T Z_M  
+       b. 更新 θ_new = θ_old + β·Δθ  
+       c. 调整采样位置 S_new = S_old - γ·x[n]  
+       d. 判断收敛条件（||Δθ|| < ξ 或迭代超限）  
+     }  
+4. 结果计算  
+   - 计算 PJ幅度：A = sqrt(a² + b²)  
+   - 计算 ISI pk-pk：max(J_i) - min(J_i)  
+   - 存储结果至 `JitterResult` 并生成报告。  
+5. 代码修改与扩展
+扩展 JitterParameter 结构体
+struct JitterParameter {
+    // 新增字段
+    DOUBLE pJ_freq;          // PJ频率（单位：Hz）
+    DOUBLE S0;                // 初始采样位置（单位：秒）
+    UINT32 isi_precursor_bits;// ISI建模的前导码位数（默认k=4）
+    // 原有字段...
+};
+
+新增 JitterDecomposer 类
+class JitterDecomposer {
+public:
+    void init(const JitterParameter& params);
+    void decompose(JitterResult& results);
+private:
+    Eigen::MatrixXd buildHMatrix(const ARRAY_D& tie_data);
+    Eigen::VectorXd leastSquares(const Eigen::MatrixXd& H, const Eigen::VectorXd& Z);
+    bool checkConvergence(const Eigen::VectorXd& delta_theta);
+    // 存储中间参数
+    Eigen::VectorXd theta;    // [a, b, J_DCD, J_0, ..., J_{2^k-1}]
+    double S_current;         // 当前采样位置
+};
+
+修改 calculateJitterValues 函数
+static Boolean calculateJitterValues(ARRAY_D& wave_meas, JitterWaves& wave, const JitterParameter& params) {
+    // 原有逻辑生成 wave_jitter...
+    // 新增：调用 JitterDecomposer 进行抖动分解
+    JitterDecomposer decomposer;
+    decomposer.init(params);
+    decomposer.decompose(wave);
+    return true;
+}
+6. 关键集成点
+-原始时间戳序列重构
+
+
+-时间戳到相对TIE的转换
+在 calculateJitterValues 中新增逻辑，根据 params.mode 计算相对TIE：
+
+if (params.mode == "DATA") {
+    // 计算理想翻转点：S0 + n * UI
+    for (int i = 0; i < size; i++) {
+        double ideal_edge = params.S0 + i * params.ui_ns * 1e-9;
+        wave.wave_jitter[i] = wave_meas[i] - ideal_edge;
+    }
+}
+-最小二乘实现
+使用 Eigen 库进行矩阵运算：
+Eigen::VectorXd leastSquares(const Eigen::MatrixXd& H, const Eigen::VectorXd& Z) {
+    return (H.transpose() * H).inverse() * H.transpose() * Z;
+}
+7. 验证与测试
+单元测试
+
+验证 buildHMatrix 生成的矩阵是否符合论文模型（如 PJ 的正弦/余弦项、DCD的交替符号）。
+
+测试迭代收敛性：输入预设抖动数据，检查输出误差是否 <5%。
+
+集成测试
+对比机台内置工具（如 JNEVe）的抖动分解结果，确保一致性。
+测试边界条件：全0/全1数据、高噪声数据（RJ主导）。
+
+性能优化
+
+使用稀疏矩阵优化 ISI 子矩阵（若前导码组合稀疏）。
+
+预分配内存避免动态分配（尤其针对大规模数据块）。
+
+8. 交付物
+代码修改
+
+扩展后的 TMUJitterUnit.hpp（包含 JitterDecomposer 类及适配逻辑）。
+
+新增 JitterDecomposer.cpp 实现核心算法。
+
+测试用例
+
+仿真测试脚本（生成含预设 PJ/DCD/ISI 的时间戳数据）。
+
+机台实测配置文件（.cfg）。
+
+文档更新
+
+用户手册：新增抖动分解参数配置说明。
+
+API文档：描述新增方法与字段。
